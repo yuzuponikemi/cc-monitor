@@ -1,0 +1,77 @@
+/**
+ * FL-1085 differential harness.
+ *
+ * Loads a built dataLoader.js, runs loadUsageRecords() against the real
+ * ~/.claude corpus, and writes a summary so the pre-fix and post-fix builds can
+ * be compared for identical output (and for cost: wall time and peak heap).
+ *
+ * Usage: node fl1085_differential.js <path-to-out/dataLoader.js> <out.json> [passes]
+ *
+ * Env:
+ *   FL1085_DIR     scan this directory instead of ~/.claude. Point it at a frozen
+ *                  copy of projects/ -- the live corpus is appended to while the
+ *                  harness runs, which makes record counts differ between runs.
+ *   FL1085_ANALYZE 0 to pass analyzeContent:false (the cheaper code path).
+ */
+const path = require('path');
+const fs = require('fs');
+
+const loaderPath = path.resolve(process.argv[2]);
+const outPath = path.resolve(process.argv[3]);
+const passes = Number(process.argv[4] || 1);
+
+const { ClaudeDataLoader } = require(loaderPath);
+
+function stable(value) {
+  // Deterministic JSON for comparison: sort object keys, keep array order.
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(stable);
+  if (value instanceof Set) return { __set: [...value].sort() };
+  if (value instanceof Map) return { __map: [...value.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0]))) };
+  const out = {};
+  for (const k of Object.keys(value).sort()) out[k] = stable(value[k]);
+  return out;
+}
+
+(async () => {
+  const perPass = [];
+  let last = null;
+  let peakHeap = 0;
+  const sampler = setInterval(() => {
+    const h = process.memoryUsage().heapUsed;
+    if (h > peakHeap) peakHeap = h;
+  }, 100);
+
+  for (let p = 0; p < passes; p++) {
+    const t0 = Date.now();
+    const loaded = await ClaudeDataLoader.loadUsageRecords(process.env.FL1085_DIR || undefined, {
+      analyzeContent: process.env.FL1085_ANALYZE !== '0',
+    });
+    const ms = Date.now() - t0;
+    const usage = ClaudeDataLoader.calculateUsageData(loaded.records);
+    perPass.push({
+      pass: p + 1,
+      ms,
+      records: loaded.records.length,
+      heapUsedAfterMB: +(process.memoryUsage().heapUsed / 1048576).toFixed(1),
+    });
+    last = { loaded, usage };
+    console.error(`pass ${p + 1}: ${ms} ms, ${loaded.records.length} records`);
+  }
+  clearInterval(sampler);
+
+  const summary = {
+    loaderPath,
+    passes: perPass,
+    peakHeapUsedMB: +(peakHeap / 1048576).toFixed(1),
+    records: last.loaded.records.length,
+    usage: stable(last.usage),
+    contentAnalysis: stable(last.loaded.contentAnalysis),
+    activityAnalysis: stable(last.loaded.activityAnalysis),
+  };
+  fs.writeFileSync(outPath, JSON.stringify(summary, null, 1), 'utf-8');
+  console.error(`wrote ${outPath}`);
+})().catch((e) => {
+  console.error('FAILED', e);
+  process.exit(1);
+});
