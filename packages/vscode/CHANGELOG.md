@@ -6,6 +6,27 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-08-03
+
+### Fixed
+
+- **Stopped reading every transcript twice on every refresh.** `getEarliestTimestamp`
+  read a whole `.jsonl` just to get the timestamp on its first line, and
+  `sortFilesByTimestamp` ran that over every file through an unbounded
+  `Promise.all` — so each refresh read the entire history twice and could hold
+  ~1,300 files in memory at once. On a 974 MB corpus with the default 60s refresh
+  this repeatedly hit Electron's hard 4 GiB V8 heap ceiling and aborted the
+  extension host with a Chromium OOM (`0xE0000008`); when the browser process was
+  the one that died it took the whole window, and every Claude Code session in its
+  integrated terminal, with it. Now: stream and stop at the first timestamp and
+  memoise that one number per file, cap sort concurrency at 8, and stream lines
+  instead of `readFile` + `split('
+')` (which held the file content and the array
+  of all its lines simultaneously). Output is unchanged — `usage`,
+  `contentAnalysis` and `activityAnalysis` are byte-identical across 33,024
+  records. The smallest heap a full pass completes in went from >512 MB to
+  <=384 MB, and a pass is ~21% faster. Investigation: FL-1085.
+
 ## [2.1.0] - 2026-06-24
 
 ### Changed
