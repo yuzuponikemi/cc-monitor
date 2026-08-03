@@ -106,27 +106,23 @@ async function mapWithConcurrency<T, R>(
 }
 
 /**
- * Per-file caches. Transcripts are append-only, so:
- *  - the first timestamp of a file never changes once written;
- *  - a file whose size and mtime are unchanged yields exactly the same records.
- * Without these, every refresh re-read and re-parsed the entire history
- * (measured +124 MB/min of garbage, sawtoothing to 3.5 GB — FL-1085).
+ * Memoised first timestamp per file, used only for sorting. A found timestamp is
+ * cached forever -- transcripts are append-only, so the first line never
+ * changes. "Not found" is cached against the size it was observed at, so a file
+ * that was still empty when we first looked is re-examined once it grows instead
+ * of being pinned to epoch 0 for the rest of the session (which would also
+ * perturb the sort order, and with it the cross-file de-duplication order).
+ *
+ * This holds one number per file and nothing else. Caching the parsed *records*
+ * per file was tried and reverted: it retained +1.1 GB on this corpus, because
+ * keeping a stale file skippable also means keeping its undated lines (undated
+ * lines bypass analyzeLine's cutoff, so they contribute from arbitrarily old
+ * files) -- and individual undated lines such as `file-history-snapshot` and
+ * `last-prompt` reach 2.8-5.9 MB each. Retaining anything per file is the wrong
+ * trade in a process with a 4 GiB ceiling; see FL-1085 R002.
  */
 const earliestTimestampCache = new Map<string, number>();
-interface CachedFileRecords {
-  size: number;
-  mtimeMs: number;
-  /** Validated + tagged records, BEFORE the cross-file hash de-duplication. */
-  records: ClaudeUsageRecord[];
-  /**
-   * Lines with no parseable `timestamp`. analyzeLine() only applies its cutoff
-   * when a line HAS a timestamp, so undated lines (pr-link, ai-title, …) still
-   * contribute even from an old file. Keeping them means a stale file can be
-   * skipped without changing the analysis result.
-   */
-  undatedForAnalysis: unknown[];
-}
-const fileRecordsCache = new Map<string, CachedFileRecords>();
+const earliestTimestampMisses = new Map<string, number>();
 
 /** Drop cache entries for files that no longer exist in the scanned set. */
 function pruneFileCaches(livePaths: Set<string>): void {
@@ -135,9 +131,9 @@ function pruneFileCaches(livePaths: Set<string>): void {
       earliestTimestampCache.delete(key);
     }
   }
-  for (const key of fileRecordsCache.keys()) {
+  for (const key of earliestTimestampMisses.keys()) {
     if (!livePaths.has(key)) {
-      fileRecordsCache.delete(key);
+      earliestTimestampMisses.delete(key);
     }
   }
 }
@@ -779,65 +775,15 @@ export class ClaudeDataLoader {
 
       for (const file of sortedFiles) {
         try {
-          let stats: { size: number; mtimeMs: number } | null = null;
-          try {
-            const s = await stat(file);
-            stats = { size: s.size, mtimeMs: s.mtimeMs };
-          } catch {
-            stats = null;
-          }
-
-          // analyzeLine() discards every DATED line older than the cutoff, so a
-          // file whose last append predates the cutoff contributes only through
-          // its undated lines — which are cached separately. Transcripts are
-          // append-only, so mtime is a safe proxy for "newest line" (a restored
-          // copy only ever looks newer, which errs toward including it).
-          const withinAnalysisWindow = stats === null || stats.mtimeMs >= analysisCutoffMs;
-          const needsLines = analysis !== null && withinAnalysisWindow;
-
-          const cached = stats && fileRecordsCache.get(file);
-          if (cached && cached.size === stats!.size && cached.mtimeMs === stats!.mtimeMs && !needsLines) {
-            // Unchanged and outside the analysis window: reuse the parsed
-            // records as-is. No I/O, no JSON.parse, no garbage.
-            if (analysis) {
-              for (const parsed of cached.undatedForAnalysis) {
-                analyzeLine(parsed, analysis);
-              }
-            }
-            for (const record of cached.records) {
-              const uniqueHash = this.createUniqueHash(record);
-              if (uniqueHash && processedHashes.has(uniqueHash)) {
-                continue;
-              }
-              if (uniqueHash) {
-                processedHashes.add(uniqueHash);
-              }
-              records.push(record);
-            }
-            if (++fileIndex % 25 === 0) {
-              await new Promise((resolve) => setTimeout(resolve, 0));
-            }
-            continue;
-          }
-
           // Each .jsonl file is one Claude Code conversation/session.
           const sessionInfo = this.parseSessionInfo(file);
-          const fileRecords: ClaudeUsageRecord[] = [];
-          const undatedForAnalysis: unknown[] = [];
 
           for await (const line of readJsonlLines(file)) {
             try {
               const parsed = JSON.parse(line) as unknown;
 
-              const ts = (parsed as { timestamp?: unknown }).timestamp;
-              const undated = !(typeof ts === 'string' && !isNaN(Date.parse(ts)));
-              if (undated) {
-                undatedForAnalysis.push(parsed);
-              }
-
               // Feed every line into the content analysis (not only usage records).
-              // Undated lines are never cutoff-filtered, so they always count.
-              if (analysis && (withinAnalysisWindow || undated)) {
+              if (analysis) {
                 analyzeLine(parsed, analysis);
               }
 
@@ -864,10 +810,6 @@ export class ClaudeDataLoader {
               const gitBranch = (parsed as { gitBranch?: unknown }).gitBranch;
               record._gitBranch = typeof gitBranch === 'string' && gitBranch.trim() !== '' ? gitBranch : undefined;
 
-              // Cache pre-de-duplication so the cross-file hash pass below stays
-              // identical to the non-cached path.
-              fileRecords.push(record);
-
               const uniqueHash = this.createUniqueHash(record);
               if (uniqueHash && processedHashes.has(uniqueHash)) {
                 continue;
@@ -879,15 +821,6 @@ export class ClaudeDataLoader {
             } catch (parseError) {
               console.warn(`Failed to parse line in ${file}:`, parseError);
             }
-          }
-
-          if (stats) {
-            fileRecordsCache.set(file, {
-              size: stats.size,
-              mtimeMs: stats.mtimeMs,
-              records: fileRecords,
-              undatedForAnalysis,
-            });
           }
         } catch (fileError) {
           console.warn(`Failed to read file ${file}:`, fileError);
@@ -1678,7 +1611,17 @@ export class ClaudeDataLoader {
   private static async getEarliestTimestamp(filePath: string): Promise<Date | null> {
     const cached = earliestTimestampCache.get(filePath);
     if (cached !== undefined) {
-      return cached === 0 ? null : new Date(cached);
+      return new Date(cached);
+    }
+    let size: number | null = null;
+    try {
+      size = (await stat(filePath)).size;
+    } catch {
+      size = null;
+    }
+    const missedAt = earliestTimestampMisses.get(filePath);
+    if (missedAt !== undefined && size !== null && missedAt === size) {
+      return null; // unchanged since we last looked and found nothing
     }
     try {
       for await (const line of readJsonlLines(filePath)) {
@@ -1688,6 +1631,7 @@ export class ClaudeDataLoader {
             const date = new Date(json.timestamp);
             if (!isNaN(date.getTime())) {
               earliestTimestampCache.set(filePath, date.getTime());
+              earliestTimestampMisses.delete(filePath);
               return date;
             }
           }
@@ -1695,7 +1639,9 @@ export class ClaudeDataLoader {
           // Skip invalid lines
         }
       }
-      earliestTimestampCache.set(filePath, 0);
+      if (size !== null) {
+        earliestTimestampMisses.set(filePath, size);
+      }
       return null;
     } catch {
       return null;

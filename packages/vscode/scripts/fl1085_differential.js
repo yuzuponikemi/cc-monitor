@@ -49,11 +49,22 @@ function stable(value) {
     });
     const ms = Date.now() - t0;
     const usage = ClaudeDataLoader.calculateUsageData(loaded.records);
+    // Retained footprint: peak heapUsed only reflects how lazily V8 chose to
+    // collect, so it swings wildly between runs. Forcing a full GC and then
+    // reading heapUsed measures what the code actually holds on to, which is
+    // what a per-file cache changes. Run node with --expose-gc to get it.
+    let retainedMB = null;
+    if (typeof global.gc === 'function') {
+      global.gc();
+      global.gc();
+      retainedMB = +(process.memoryUsage().heapUsed / 1048576).toFixed(1);
+    }
     perPass.push({
       pass: p + 1,
       ms,
       records: loaded.records.length,
       heapUsedAfterMB: +(process.memoryUsage().heapUsed / 1048576).toFixed(1),
+      retainedMB,
     });
     last = { loaded, usage };
     console.error(`pass ${p + 1}: ${ms} ms, ${loaded.records.length} records`);
@@ -71,6 +82,14 @@ function stable(value) {
   };
   fs.writeFileSync(outPath, JSON.stringify(summary, null, 1), 'utf-8');
   console.error(`wrote ${outPath}`);
+
+  // FL1085_SNAPSHOT=<path>: dump the post-GC heap so the retained set can be
+  // attributed by class instead of guessed at.
+  if (process.env.FL1085_SNAPSHOT) {
+    if (typeof global.gc === 'function') { global.gc(); global.gc(); }
+    require('v8').writeHeapSnapshot(process.env.FL1085_SNAPSHOT);
+    console.error(`heap snapshot -> ${process.env.FL1085_SNAPSHOT}`);
+  }
 })().catch((e) => {
   console.error('FAILED', e);
   process.exit(1);
