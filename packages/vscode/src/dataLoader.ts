@@ -1,7 +1,8 @@
 import * as fs from 'fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import * as os from 'os';
 import * as path from 'path';
+import * as readline from 'node:readline';
 // Removed tinyglobby dependency - using native fs instead
 // Removed zod dependency - using native validation instead
 import { calculateCostBreakdown, getModelContextLimit, getModelPricing } from './pricing';
@@ -60,6 +61,81 @@ async function findJsonlFiles(dir: string): Promise<string[]> {
 
   await searchRecursively(dir);
   return files;
+}
+
+/**
+ * Stream a .jsonl file line by line.
+ *
+ * Reading a whole transcript with readFile and then split('\n') holds the file
+ * content and the array of every line at the same time, so the peak is ~2x the
+ * file. Transcripts here total 800 MB across 1,285 files, and the extension host
+ * has a hard 4 GiB V8 heap ceiling, so that peak is what kills it (FL-1085).
+ */
+async function* readJsonlLines(filePath: string): AsyncGenerator<string> {
+  const stream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (line.trim() !== '') {
+        yield line;
+      }
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+}
+
+/** Run an async mapper over items with a bounded number in flight. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T) => Promise<R>
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await mapper(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/**
+ * Memoised first timestamp per file, used only for sorting. A found timestamp is
+ * cached forever -- transcripts are append-only, so the first line never
+ * changes. "Not found" is cached against the size it was observed at, so a file
+ * that was still empty when we first looked is re-examined once it grows instead
+ * of being pinned to epoch 0 for the rest of the session (which would also
+ * perturb the sort order, and with it the cross-file de-duplication order).
+ *
+ * This holds one number per file and nothing else. Caching the parsed *records*
+ * per file was tried and reverted: it retained +1.1 GB on this corpus, because
+ * keeping a stale file skippable also means keeping its undated lines (undated
+ * lines bypass analyzeLine's cutoff, so they contribute from arbitrarily old
+ * files) -- and individual undated lines such as `file-history-snapshot` and
+ * `last-prompt` reach 2.8-5.9 MB each. Retaining anything per file is the wrong
+ * trade in a process with a 4 GiB ceiling; see FL-1085 R002.
+ */
+const earliestTimestampCache = new Map<string, number>();
+const earliestTimestampMisses = new Map<string, number>();
+
+/** Drop cache entries for files that no longer exist in the scanned set. */
+function pruneFileCaches(livePaths: Set<string>): void {
+  for (const key of earliestTimestampCache.keys()) {
+    if (!livePaths.has(key)) {
+      earliestTimestampCache.delete(key);
+    }
+  }
+  for (const key of earliestTimestampMisses.keys()) {
+    if (!livePaths.has(key)) {
+      earliestTimestampMisses.delete(key);
+    }
+  }
 }
 
 // Native validation function to replace zod
@@ -687,25 +763,22 @@ export class ClaudeDataLoader {
       }
 
       const sortedFiles = await this.sortFilesByTimestamp(allFiles);
+      pruneFileCaches(new Set(sortedFiles));
+
       const processedHashes = new Set<string>();
       const records: ClaudeUsageRecord[] = [];
       // Content analysis (last 30 days) is optional — skipped when the user
       // disables it via claudeCodeUsage.enableContentAnalysis.
-      const analysis = analyzeContent ? newAnalysisAcc(Date.now() - 30 * 24 * 60 * 60 * 1000, 30) : null;
+      const analysisCutoffMs = Date.now() - 30 * 24 * 60 * 60 * 1000;
+      const analysis = analyzeContent ? newAnalysisAcc(analysisCutoffMs, 30) : null;
       let fileIndex = 0;
 
       for (const file of sortedFiles) {
         try {
-          const content = await readFile(file, 'utf-8');
-          const lines = content
-            .trim()
-            .split('\n')
-            .filter((line) => line.trim() !== '');
-
           // Each .jsonl file is one Claude Code conversation/session.
           const sessionInfo = this.parseSessionInfo(file);
 
-          for (const line of lines) {
+          for await (const line of readJsonlLines(file)) {
             try {
               const parsed = JSON.parse(line) as unknown;
 
@@ -719,15 +792,6 @@ export class ClaudeDataLoader {
               }
 
               const data = parsed;
-              const uniqueHash = this.createUniqueHash(data);
-
-              if (uniqueHash && processedHashes.has(uniqueHash)) {
-                continue;
-              }
-
-              if (uniqueHash) {
-                processedHashes.add(uniqueHash);
-              }
 
               // Tag the record with the session/project it came from.
               // Prefer the real working directory (`cwd`) recorded in the log line
@@ -745,6 +809,14 @@ export class ClaudeDataLoader {
               }
               const gitBranch = (parsed as { gitBranch?: unknown }).gitBranch;
               record._gitBranch = typeof gitBranch === 'string' && gitBranch.trim() !== '' ? gitBranch : undefined;
+
+              const uniqueHash = this.createUniqueHash(record);
+              if (uniqueHash && processedHashes.has(uniqueHash)) {
+                continue;
+              }
+              if (uniqueHash) {
+                processedHashes.add(uniqueHash);
+              }
               records.push(record);
             } catch (parseError) {
               console.warn(`Failed to parse line in ${file}:`, parseError);
@@ -1528,19 +1600,38 @@ export class ClaudeDataLoader {
     return cleaned.length > MAX ? cleaned.slice(0, MAX - 1) + '…' : cleaned;
   }
 
+  /**
+   * First usable timestamp in a transcript.
+   *
+   * Streams and stops at the first line that carries one instead of reading the
+   * whole file, and memoises the answer: transcripts are append-only, so the
+   * first line never changes. Previously this read every byte of every file on
+   * every refresh purely to sort them (FL-1085).
+   */
   private static async getEarliestTimestamp(filePath: string): Promise<Date | null> {
+    const cached = earliestTimestampCache.get(filePath);
+    if (cached !== undefined) {
+      return new Date(cached);
+    }
+    let size: number | null = null;
     try {
-      const content = await readFile(filePath, 'utf-8');
-      const lines = content.trim().split('\n');
-
-      for (const line of lines) {
-        if (line.trim() === '') continue;
-
+      size = (await stat(filePath)).size;
+    } catch {
+      size = null;
+    }
+    const missedAt = earliestTimestampMisses.get(filePath);
+    if (missedAt !== undefined && size !== null && missedAt === size) {
+      return null; // unchanged since we last looked and found nothing
+    }
+    try {
+      for await (const line of readJsonlLines(filePath)) {
         try {
           const json = JSON.parse(line) as Record<string, unknown>;
           if (typeof json.timestamp === 'string') {
             const date = new Date(json.timestamp);
             if (!isNaN(date.getTime())) {
+              earliestTimestampCache.set(filePath, date.getTime());
+              earliestTimestampMisses.delete(filePath);
               return date;
             }
           }
@@ -1548,7 +1639,9 @@ export class ClaudeDataLoader {
           // Skip invalid lines
         }
       }
-
+      if (size !== null) {
+        earliestTimestampMisses.set(filePath, size);
+      }
       return null;
     } catch {
       return null;
@@ -1556,15 +1649,15 @@ export class ClaudeDataLoader {
   }
 
   private static async sortFilesByTimestamp(files: string[]): Promise<string[]> {
-    const filesWithTimestamps = await Promise.all(
-      files.map(async (file) => {
-        const timestamp = await this.getEarliestTimestamp(file);
-        return {
-          file,
-          timestamp: timestamp || new Date(0),
-        };
-      })
-    );
+    // Bounded concurrency: an unbounded Promise.all over ~1,300 transcripts put
+    // every file in flight at once, which is a large simultaneous allocation.
+    const filesWithTimestamps = await mapWithConcurrency(files, 8, async (file) => {
+      const timestamp = await this.getEarliestTimestamp(file);
+      return {
+        file,
+        timestamp: timestamp || new Date(0),
+      };
+    });
 
     return filesWithTimestamps.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime()).map((item) => item.file);
   }
