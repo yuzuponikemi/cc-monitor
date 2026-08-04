@@ -113,22 +113,110 @@ async function mapWithConcurrency<T, R>(
  * of being pinned to epoch 0 for the rest of the session (which would also
  * perturb the sort order, and with it the cross-file de-duplication order).
  *
- * This holds one number per file and nothing else. Caching the parsed *records*
- * per file was tried and reverted: it retained +1.1 GB on this corpus, because
- * keeping a stale file skippable also means keeping its undated lines (undated
- * lines bypass analyzeLine's cutoff, so they contribute from arbitrarily old
- * files) -- and individual undated lines such as `file-history-snapshot` and
- * `last-prompt` reach 2.8-5.9 MB each. Retaining anything per file is the wrong
- * trade in a process with a 4 GiB ceiling; see FL-1085 R002.
+ * This holds one number per file and nothing else.
  */
 const earliestTimestampCache = new Map<string, number>();
 const earliestTimestampMisses = new Map<string, number>();
+
+/**
+ * Per-file cache of what a transcript contributes, so an unchanged file is never
+ * re-read. This is the point of the whole exercise: a refresh is triggered by the
+ * recursive watcher on ~/.claude/projects every time Claude Code appends a line,
+ * and re-parsing all 1,300 files / 800 MB for one appended line is what pinned
+ * two extension hosts at >100% CPU and 2.3-4.1 GB (FL-1085 R004).
+ *
+ * What is cached is deliberately narrow:
+ *
+ *  - `records`: the usage records this file CONTRIBUTED, i.e. after the
+ *    cross-file hash de-duplication. These are the same objects the caller keeps
+ *    in its own `cache.records`, so holding them here is not a second copy.
+ *  - `analysisLines`: only those raw lines that can still reach analyzeLine's
+ *    accumulators from an out-of-window file. analyzeLine returns early for any
+ *    line without a `message` object, so that is just `pr-link` and `ai-title`
+ *    (audited over 1,300 files: 1.04 MB total, and no undated line has a
+ *    `message` at all). The big undated types are excluded on purpose:
+ *    `file-history-snapshot` alone is 11.3 MB and contributes nothing.
+ *
+ * Raw lines are kept verbatim and handed to analyzeLine rather than
+ * pre-extracting their fields, so this cache cannot drift from what analyzeLine
+ * actually does. `analysisLineIsRelevant` errs toward keeping a line.
+ */
+interface CachedFile {
+  size: number;
+  mtimeMs: number;
+  records: ClaudeUsageRecord[];
+  analysisLines: string[];
+}
+const fileCache = new Map<string, CachedFile>();
+
+/**
+ * Counters + a footprint probe for the cache. FL-1085 burned two review cycles on
+ * *inferring* where retained memory had gone and being wrong both times, so the
+ * cache reports its own size from inside the process.
+ */
+let fl1085CacheHits = 0;
+let fl1085CacheMisses = 0;
+
+export function fl1085CacheStats(): {
+  hits: number;
+  misses: number;
+  files: number;
+  records: number;
+  analysisLines: number;
+  analysisLineChars: number;
+} {
+  let records = 0;
+  let analysisLines = 0;
+  let analysisLineChars = 0;
+  for (const e of fileCache.values()) {
+    records += e.records.length;
+    analysisLines += e.analysisLines.length;
+    for (const l of e.analysisLines) {
+      analysisLineChars += l.length;
+    }
+  }
+  return {
+    hits: fl1085CacheHits,
+    misses: fl1085CacheMisses,
+    files: fileCache.size,
+    records,
+    analysisLines,
+    analysisLineChars,
+  };
+}
+
+/** Test/diagnostic hook: forget everything so a run starts cold. */
+export function fl1085ResetCaches(): void {
+  fileCache.clear();
+  earliestTimestampCache.clear();
+  earliestTimestampMisses.clear();
+  fl1085CacheHits = 0;
+  fl1085CacheMisses = 0;
+}
+
+/** Undated lines that analyzeLine can still act on. Conservative by design. */
+function analysisLineIsRelevant(parsed: unknown): boolean {
+  if (!parsed || typeof parsed !== 'object') {
+    return false;
+  }
+  const o = parsed as { type?: unknown; message?: unknown };
+  if (o.type === 'pr-link' || o.type === 'ai-title') {
+    return true;
+  }
+  // Future-proofing: analyzeLine's remaining branches all require `message`.
+  return !!o.message && typeof o.message === 'object';
+}
 
 /** Drop cache entries for files that no longer exist in the scanned set. */
 function pruneFileCaches(livePaths: Set<string>): void {
   for (const key of earliestTimestampCache.keys()) {
     if (!livePaths.has(key)) {
       earliestTimestampCache.delete(key);
+    }
+  }
+  for (const key of fileCache.keys()) {
+    if (!livePaths.has(key)) {
+      fileCache.delete(key);
     }
   }
   for (const key of earliestTimestampMisses.keys()) {
@@ -775,12 +863,73 @@ export class ClaudeDataLoader {
 
       for (const file of sortedFiles) {
         try {
+          let stats: { size: number; mtimeMs: number } | null = null;
+          try {
+            const s = await stat(file);
+            stats = { size: s.size, mtimeMs: s.mtimeMs };
+          } catch {
+            stats = null;
+          }
+
+          // A file whose last append predates the analysis cutoff has no dated
+          // line inside the window, so its only possible contribution is its
+          // cached `analysisLines`. Transcripts are append-only, so mtime is a
+          // safe proxy for "newest line" (a restored copy only looks newer,
+          // which errs toward re-reading it).
+          const inWindow = stats === null || stats.mtimeMs >= analysisCutoffMs;
+          const mustReadForAnalysis = analysis !== null && inWindow;
+
+          const cached = stats ? fileCache.get(file) : undefined;
+          if (cached && cached.size === stats!.size && cached.mtimeMs === stats!.mtimeMs && !mustReadForAnalysis) {
+            fl1085CacheHits++;
+            if (analysis) {
+              for (const raw of cached.analysisLines) {
+                try {
+                  analyzeLine(JSON.parse(raw), analysis);
+                } catch {
+                  // Already parsed once when it was cached; ignore oddities.
+                }
+              }
+            }
+            for (const record of cached.records) {
+              const uniqueHash = this.createUniqueHash(record);
+              if (uniqueHash && processedHashes.has(uniqueHash)) {
+                continue;
+              }
+              if (uniqueHash) {
+                processedHashes.add(uniqueHash);
+              }
+              records.push(record);
+            }
+            if (++fileIndex % 25 === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+            continue;
+          }
+
+          fl1085CacheMisses++;
           // Each .jsonl file is one Claude Code conversation/session.
           const sessionInfo = this.parseSessionInfo(file);
+          const fileRecords: ClaudeUsageRecord[] = [];
+          const analysisLines: string[] = [];
 
           for await (const line of readJsonlLines(file)) {
             try {
               const parsed = JSON.parse(line) as unknown;
+
+              const ts = (parsed as { timestamp?: unknown }).timestamp;
+              const dated = typeof ts === 'string' && !isNaN(Date.parse(ts));
+              if (!dated && analysisLineIsRelevant(parsed)) {
+                // Re-serialise instead of keeping `line`. readline hands back
+                // substrings of its decoded buffer, and V8 represents those as
+                // sliced strings that pin the whole parent -- with transcript
+                // lines up to 5.9 MB, caching a 100-byte ai-title line could pin
+                // megabytes. String.length reports the slice, not the parent, so
+                // this does not show up in the cache probe: it cost +868 MB of
+                // retained heap before being caught by measuring against the
+                // shipped build on the same corpus (FL-1085 R004).
+                analysisLines.push(JSON.stringify(parsed));
+              }
 
               // Feed every line into the content analysis (not only usage records).
               if (analysis) {
@@ -818,9 +967,19 @@ export class ClaudeDataLoader {
                 processedHashes.add(uniqueHash);
               }
               records.push(record);
+              fileRecords.push(record);
             } catch (parseError) {
               console.warn(`Failed to parse line in ${file}:`, parseError);
             }
+          }
+
+          if (stats) {
+            fileCache.set(file, {
+              size: stats.size,
+              mtimeMs: stats.mtimeMs,
+              records: fileRecords,
+              analysisLines,
+            });
           }
         } catch (fileError) {
           console.warn(`Failed to read file ${file}:`, fileError);

@@ -6,6 +6,60 @@ upstream release: 1.0.8). Format follows [Keep a Changelog](https://keepachangel
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-08-04
+
+### Fixed
+
+- **A refresh no longer re-reads transcripts that have not changed.** 2.1.1 removed
+  the *second* full read per refresh, but a refresh still parsed all 1,300 files /
+  1 GB. That matters more than the interval setting suggests, because refreshes are
+  not driven by `refreshInterval` at all in practice: a recursive `fs.watch` on
+  `~/.claude/projects` fires every time Claude Code appends a transcript line, and
+  the 1.5s debounce could not keep up with a ~13s load. Two extension hosts were
+  measured sitting at >100% CPU each and 2.3-4.1 GB, against Electron's hard 4 GiB
+  V8 heap ceiling. Now each file's contribution is cached against its
+  `(size, mtimeMs)` and only changed files are re-read, so the steady-state refresh
+  that the watcher triggers went from ~12.8s to ~0.9s (14x) with retained heap
+  *down* from 246 MB to 128 MB. Output is unchanged: `usage`, `contentAnalysis` and
+  `activityAnalysis` are identical at every leaf across 34,122 records, with and
+  without content analysis.
+
+  Two details were what made an earlier attempt at this a regression, and are worth
+  knowing before touching the cache:
+
+  - Only `pr-link` and `ai-title` lines can still reach the analysis accumulators
+    from a file older than the 30-day window (`analyzeLine` returns early for any
+    line without a `message` object). Audited across 1,300 files: that is 1.04 MB,
+    while the undated types that contribute nothing come to 17.4 MB -- and
+    `file-history-snapshot` alone is 11.3 MB.
+  - Those cached lines are re-serialised rather than stored as handed over.
+    `readline` returns substrings of its decoded buffer, V8 keeps such slices as
+    references to the whole parent, and `String.length` reports the slice -- so
+    caching a 100-byte line could pin megabytes invisibly. It cost +868 MB of
+    retained heap until it was caught by comparing against the shipped build on
+    the same corpus.
+
+- **Refreshes no longer overlap.** `refreshData()` had no re-entrancy guard while
+  being called from the timer, the file watcher, a command and activation. A second
+  full load could start while the first was still running, each holding its own
+  intermediate state. It now runs one at a time and coalesces anything requested
+  while busy into a single follow-up.
+
+### Added
+
+- `fl1085CacheStats()` / `fl1085ResetCaches()` diagnostics, so the cache reports its
+  own footprint from inside the process instead of it being inferred from heap
+  snapshots. FL-1085 got that inference wrong twice.
+
+### Notes
+
+- With content analysis enabled the files *inside* the 30-day window are still
+  re-read on every refresh, because the accumulator is rebuilt from scratch and
+  needs their lines. On this corpus that is 627 of 1,300 files, and the cache still
+  covers the other 673 (measured: ~15.4s -> ~10.7s, retained 245 -> 207 MB). Making
+  that incremental needs per-file analysis contributions that can be merged without
+  retaining lines.
+
 ## [2.1.1] - 2026-08-03
 
 ### Fixed
