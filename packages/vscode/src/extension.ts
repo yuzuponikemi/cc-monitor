@@ -20,6 +20,8 @@ export class ClaudeCodeUsageExtension {
   private fileWatcher: fs.FSWatcher | undefined;
   private watchDebounceTimer: NodeJS.Timeout | undefined;
   private watchedDir: string | null = null;
+  private refreshInFlight = false;
+  private refreshRequestedWhileInFlight = false;
   // Debounce the "context rot" toast: at most one per session, re-armed after a
   // gap. Keyed by sessionId so each running session is tracked independently.
   private lastRotNotifiedAt: Map<string, number> = new Map();
@@ -275,7 +277,35 @@ export class ClaudeCodeUsageExtension {
     return this.cache.usageLimits;
   }
 
+  /**
+   * Serialise refreshes. The recursive watcher on ~/.claude/projects fires every
+   * time Claude Code appends a transcript line, and a full load used to take
+   * ~13 s against a 1 GB corpus while the debounce was only 1.5 s -- so refreshes
+   * overlapped, each holding its own intermediate state. Two extension hosts sat
+   * at >100% CPU and 2.3-4.1 GB until they hit the 4 GiB V8 ceiling (FL-1085 R004).
+   *
+   * If a refresh is already running, remember that another was asked for and run
+   * exactly one more when it finishes, rather than starting a second one now.
+   */
   private async refreshData(): Promise<void> {
+    if (this.refreshInFlight) {
+      this.refreshRequestedWhileInFlight = true;
+      return;
+    }
+    this.refreshInFlight = true;
+    try {
+      await this.refreshDataOnce();
+    } finally {
+      this.refreshInFlight = false;
+      if (this.refreshRequestedWhileInFlight) {
+        this.refreshRequestedWhileInFlight = false;
+        // Detach so the caller's promise settles and the stack unwinds first.
+        setTimeout(() => void this.refreshData(), 0);
+      }
+    }
+  }
+
+  private async refreshDataOnce(): Promise<void> {
     try {
       const config = this.getConfiguration();
 
